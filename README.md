@@ -7,7 +7,7 @@ The purpose of this project is to find and analyze financial data where it is av
 The API comes from `Predictit`, a web platform created by Victoria University of Wellington, New Zealand. 
 
 ### II. Dependencies
-Run the command `sh install.sh` in your terminal to get all the dependencies needed to run this program.
+Run the command `pip install -r requirements.txt` or, if using `uv`, `uv ` in your terminal to get all the dependencies needed to run this program.
 
 ### III. Code
 Most of this project is written in `python`, but there are a few scripts for running the program and installing dependencies. The modules used are `json`, `openpyxl`, `os`, `pandas`, and `requests` from `urllib`.
