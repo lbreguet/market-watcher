@@ -1,4 +1,4 @@
-"""Mini terminal for PredictIt markets: market list + live chart, history kept in SQLite."""
+"""Mini terminal for Kalshi markets: event list + live chart, history kept in SQLite."""
 from __future__ import annotations
 
 import os
@@ -10,19 +10,34 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import requests
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Input
+from textual.worker import get_current_worker
 from textual_plotext import PlotextPlot
 
-API = "https://www.predictit.org/api/marketdata/all"
-POLL_SECONDS = 30.0
-TOP_CONTRACTS = 6   # lines drawn per chart
-MAX_POINTS = 500    # downsample long histories to this many points per line
-DB_PATH = Path(os.environ.get("MW_DB", Path.home() / ".local/share/market-watcher/history.db"))
+try:
+    from .backfill import backfill_missing
+    from . import config
+    from .config import DB_PATH
+    from .kalshi import Client, RateLimited, Tracker
+    from .signals import analyze
+except ImportError:  # running as a loose script
+    from backfill import backfill_missing
+    import config
+    from config import DB_PATH
+    from kalshi import Client, RateLimited, Tracker
+    from signals import analyze
+
+POLL_SECONDS = 5.0
+DISCOVERY_SECONDS = 600.0   # re-rank which events are tracked every 10 minutes
+TOP_EVENTS = int(os.environ.get("MW_EVENTS", 40))
+MIN_AGE_HOURS = float(os.environ.get("MW_MIN_AGE_HOURS", 0))  # e.g. 6 skips markets opened today
+SERIES = [s.strip() for s in os.environ.get("MW_SERIES", "").split(",") if s.strip()]
+TOP_CONTRACTS = 6    # lines drawn per chart
+MAX_POINTS = 500     # downsample long histories to this many points per line
 WINDOWS = [("15m", 900), ("1h", 3600), ("6h", 21600), ("24h", 86400), ("all", None)]
 
 try:
@@ -38,11 +53,12 @@ def stamp(ts: float, fmt: str = "%H:%M:%S") -> str:
 # ---------------------------------------------------------------- storage
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (
-    id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, series TEXT);
 CREATE TABLE IF NOT EXISTS contracts (
-    id INTEGER PRIMARY KEY, market_id INTEGER NOT NULL, name TEXT NOT NULL, price REAL);
+    id TEXT PRIMARY KEY, market_id TEXT NOT NULL, name TEXT NOT NULL, price REAL, spread REAL);
 CREATE TABLE IF NOT EXISTS samples (
-    ts REAL NOT NULL, market_id INTEGER NOT NULL, contract_id INTEGER NOT NULL, price REAL NOT NULL);
+    ts REAL NOT NULL, market_id TEXT NOT NULL, contract_id TEXT NOT NULL,
+    price REAL NOT NULL, spread REAL);
 CREATE INDEX IF NOT EXISTS idx_samples_market_ts ON samples (market_id, ts);
 """
 
@@ -58,33 +74,36 @@ class Store:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
+        # WAL needs shared memory, which WSL's mounted Windows drives (/mnt/c) don't reliably provide
+        on_windows_drive = str(self.path.resolve()).startswith("/mnt/")
+        conn.execute(f"PRAGMA journal_mode={'DELETE' if on_windows_drive else 'WAL'}")
         return conn
 
     def save(self, ts: float, rows: list[tuple]) -> None:
-        """rows: (market_id, market_name, contract_id, contract_name, price)"""
+        """rows: (market_id, market_name, series, contract_id, contract_name, price, spread)"""
         with closing(self._connect()) as conn, conn:
             conn.executemany(
-                "INSERT INTO markets VALUES (?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET name = excluded.name",
-                {(r[0], r[1]) for r in rows},
+                "INSERT INTO markets VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                "name = excluded.name, series = excluded.series",
+                {(r[0], r[1], r[2]) for r in rows},
             )
             conn.executemany(
-                "INSERT INTO contracts VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
-                "market_id = excluded.market_id, name = excluded.name, price = excluded.price",
-                [(r[2], r[0], r[3], r[4]) for r in rows],
+                "INSERT INTO contracts VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                "market_id = excluded.market_id, name = excluded.name, "
+                "price = excluded.price, spread = excluded.spread",
+                [(r[3], r[0], r[4], r[5], r[6]) for r in rows],
             )
             conn.executemany(
-                "INSERT INTO samples VALUES (?, ?, ?, ?)",
-                [(ts, r[0], r[2], r[4]) for r in rows],
+                "INSERT INTO samples VALUES (?, ?, ?, ?, ?)",
+                [(ts, r[0], r[3], r[5], r[6]) for r in rows],
             )
 
     def load_state(self):
         """Names and latest prices, so the list is populated before the first fetch."""
         with closing(self._connect()) as conn:
             markets = dict(conn.execute("SELECT id, name FROM markets"))
-            contract_names: dict[int, str] = {}
-            latest: dict[int, dict[int, float]] = defaultdict(dict)
+            contract_names: dict[str, str] = {}
+            latest: dict[str, dict[str, float]] = defaultdict(dict)
             for cid, mid, name, price in conn.execute(
                 "SELECT id, market_id, name, price FROM contracts"
             ):
@@ -93,14 +112,14 @@ class Store:
                     latest[mid][cid] = price
         return markets, contract_names, latest
 
-    def history(self, market_id: int, since: float | None) -> dict[int, list[tuple[float, float]]]:
+    def history(self, market_id: str, since: float | None) -> dict[str, list[tuple[float, float]]]:
         query = "SELECT contract_id, ts, price FROM samples WHERE market_id = ?"
         args: list = [market_id]
         if since is not None:
             query += " AND ts >= ?"
             args.append(since)
         query += " ORDER BY ts"
-        out: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        out: dict[str, list[tuple[float, float]]] = defaultdict(list)
         with closing(self._connect()) as conn:
             for cid, ts, price in conn.execute(query, args):
                 out[cid].append((ts, price))
@@ -116,7 +135,7 @@ class Store:
 
 # ---------------------------------------------------------------- app
 class MarketWatcher(App):
-    TITLE = "market-watcher"
+    TITLE = "market-watcher (Kalshi)"
     CSS = """
     #left { width: 50%; }
     #filter { margin: 0 0 1 0; }
@@ -128,6 +147,7 @@ class MarketWatcher(App):
         Binding("slash", "focus_filter", "Filter"),
         Binding("escape", "focus_table", "List"),
         Binding("w", "cycle_window", "Time window"),
+        Binding("s", "signals", "Signals"),
         Binding("p", "toggle_pause", "Pause"),
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
@@ -136,14 +156,22 @@ class MarketWatcher(App):
     def __init__(self) -> None:
         super().__init__()
         self.store = Store(DB_PATH)
-        self.market_names: dict[int, str] = {}
-        self.contract_names: dict[int, str] = {}
-        self.latest: dict[int, dict[int, float]] = defaultdict(dict)
-        self.selected: int | None = None
+        self.client = Client()
+        self.tracker = Tracker(self.client, top_events=TOP_EVENTS, series=SERIES, min_age_hours=MIN_AGE_HOURS)
+        self.market_names: dict[str, str] = {}
+        self.contract_names: dict[str, str] = {}
+        self.latest: dict[str, dict[str, float]] = defaultdict(dict)
+        self.active: set[str] | None = None  # events in the newest live snapshot
+        self.selected: str | None = None
         self.filter_text = ""
         self.paused = False
+        self.fetching = False
         self.backoff_until = 0.0
+        self.next_discovery = 0.0
+        self.backfill_pending = False
         self.window_idx = 1  # start on 1h
+        self.report = None
+        self.report_ts = 0.0
 
     # ---------- layout ----------
     def compose(self) -> ComposeResult:
@@ -169,54 +197,68 @@ class MarketWatcher(App):
 
     # ---------- data ----------
     def poll(self) -> None:
-        if not self.paused and time.time() >= self.backoff_until:
-            self.fetch()
+        if self.paused or self.fetching or time.time() < self.backoff_until:
+            return
+        self.fetching = True
+        self.fetch()
 
-    @work(thread=True, exclusive=True)
+    @work(thread=True, exclusive=True, group="fetch")
     def fetch(self) -> None:
         try:
-            r = requests.get(API, timeout=10)
-            if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", 60))
-                self.backoff_until = time.time() + wait
-                self.call_from_thread(self.set_status, f"rate limited, retrying in {wait}s")
+            if time.time() >= self.next_discovery:
+                self.call_from_thread(self.set_status, "discovering markets...")
+                if self.tracker.refresh():
+                    self.backfill_pending = True
+                self.next_discovery = time.time() + DISCOVERY_SECONDS
+            ts = config.now()  # server time, immune to a drifting system clock
+            rows = self.tracker.snapshot()
+            if not rows:
+                st = self.tracker.scan_stats
+                self.call_from_thread(self.set_status, (
+                    f"no priced markets: scanned {st.get('scanned', 0)} open markets, "
+                    f"{st.get('priced', 0)} with usable quotes, {st.get('events', 0)} events"))
                 return
-            r.raise_for_status()
-            markets = r.json()["markets"]
-            ts = time.time()
-            rows = []
-            for m in markets:
-                for c in m["contracts"]:
-                    bid, ask = c.get("bestSellYesCost"), c.get("bestBuyYesCost")
-                    price = (bid + ask) / 2 if bid is not None and ask is not None \
-                        else c.get("lastTradePrice")
-                    if price is None:
-                        continue
-                    rows.append((m["id"], str(m["shortName"]), c["id"], str(c["shortName"]), float(price)))
             self.store.save(ts, rows)
+        except RateLimited as e:
+            wait = max(e.retry_after, 5)
+            self.backoff_until = time.time() + wait
+            self.call_from_thread(self.set_status, f"rate limited, retrying in {wait:.0f}s")
+            return
         except Exception as e:  # network or db hiccups shouldn't kill the UI
             self.call_from_thread(self.set_status, f"error: {e}")
             return
+        finally:
+            self.fetching = False
         self.call_from_thread(self.apply, rows, ts)
 
     def apply(self, rows: list[tuple], ts: float) -> None:
-        for mid, mname, cid, cname, price in rows:
+        self.active = set()
+        for mid, mname, _series, cid, cname, price, _spread in rows:
+            self.active.add(mid)
             self.market_names[mid] = mname
             self.contract_names[cid] = cname
             self.latest[mid][cid] = price
 
         table = self.query_one(DataTable)
-        if {int(k.value) for k in table.rows} != set(self.visible_markets()):
+        if {k.value for k in table.rows} != set(self.visible_markets()):
             self.rebuild_table()
         else:
             for key in list(table.rows):
-                leader, price = self.leader(int(key.value))
+                leader, price = self.leader(key.value)
                 table.update_cell(key, "leader", leader)
                 table.update_cell(key, "price", price)
         self.redraw()
-        self.set_status(f"updated {stamp(ts)} | {len(self.market_names)} markets")
+        skew = config.OFFSET
+        note = (f" | system clock {'behind' if skew > 0 else 'ahead of'} Kalshi by {abs(skew) / 3600:.1f}h"
+                if abs(skew) > 120 else "")
+        if self.tracker.scan_stats.get("relaxed"):
+            note += " | nothing older than the age filter was found, showing newest"
+        self.set_status(f"updated {stamp(ts)} | tracking {len(self.active)} events{note}")
+        if self.backfill_pending:  # new events were discovered: fill their history
+            self.backfill_pending = False
+            self.run_backfill()
 
-    def leader(self, mid: int) -> tuple[str, str]:
+    def leader(self, mid: str) -> tuple[str, str]:
         latest = self.latest.get(mid)
         if not latest:
             return "-", "-"
@@ -224,9 +266,10 @@ class MarketWatcher(App):
         return self.contract_names[cid][:16], f"{latest[cid]:.3f}"
 
     # ---------- table ----------
-    def visible_markets(self) -> list[int]:
+    def visible_markets(self) -> list[str]:
         needle = self.filter_text.lower()
-        ids = [m for m, n in self.market_names.items() if not needle or needle in n.lower()]
+        ids = [m for m, n in self.market_names.items()
+               if (self.active is None or m in self.active) and (not needle or needle in n.lower())]
         return sorted(ids, key=lambda m: self.market_names[m].lower())
 
     def rebuild_table(self) -> None:
@@ -235,16 +278,16 @@ class MarketWatcher(App):
         table.clear()
         for mid in self.visible_markets():
             leader, price = self.leader(mid)
-            table.add_row(self.market_names[mid], leader, price, key=str(mid))
+            table.add_row(self.market_names[mid], leader, price, key=mid)
         if keep is not None:
             try:
-                table.move_cursor(row=table.get_row_index(str(keep)))
+                table.move_cursor(row=table.get_row_index(keep))
             except Exception:  # selected market is filtered out
                 pass
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.row_key is not None and event.row_key.value is not None:
-            self.selected = int(event.row_key.value)
+            self.selected = event.row_key.value
             self.redraw()
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -264,9 +307,9 @@ class MarketWatcher(App):
         name = self.market_names.get(mid, "") if mid is not None else ""
 
         series = {}
-        top: list[int] = []
+        top: list[str] = []
         if mid is not None:
-            since = time.time() - span if span else None
+            since = config.now() - span if span else None
             series = self.store.history(mid, since)
             latest = self.latest.get(mid, {})
             top = sorted((c for c in series if c in latest), key=lambda c: latest[c], reverse=True)
@@ -282,7 +325,7 @@ class MarketWatcher(App):
         for cid in top:
             pts = series[cid]
             plt.plot([stamp(t, "%Y-%m-%d %H:%M:%S") for t, _ in pts],
-                     [p for _, p in pts], label=self.contract_names.get(cid, str(cid)))
+                     [p for _, p in pts], label=self.contract_names.get(cid, cid))
 
         prices = [p for cid in top for _, p in series[cid]]
         lo, hi = min(prices), max(prices)
@@ -290,14 +333,54 @@ class MarketWatcher(App):
         plt.ylim(max(0, lo - pad), min(1, hi + pad))
 
         n = len(series[top[0]])
-        plt.title(f"{name} [{label}, {n} pts]")
+        plt.title(f"{name[:60]} [{label}, {n} pts]")
         plt.xlabel("time")
         plt.ylabel("price ($)")
         chart.refresh()
 
+    # ---------- backfill ----------
+    @work(thread=True, exclusive=True, group="backfill")
+    def run_backfill(self) -> None:
+        worker = get_current_worker()
+
+        def progress(done: int, total: int, mid: str, added: int) -> None:
+            self.call_from_thread(self.on_backfill, done, total, mid, added)
+
+        try:
+            backfill_missing(self.client, DB_PATH, first=self.selected, on_progress=progress,
+                             should_stop=lambda: worker.is_cancelled)
+        except Exception as e:
+            self.call_from_thread(self.set_status, f"backfill error: {e}")
+
+    def on_backfill(self, done: int, total: int, mid: str, added: int) -> None:
+        if done < total:
+            self.set_status(f"backfilling history {done}/{total} ({added} rows)")
+        elif added:
+            self.set_status(f"history backfill complete ({added} rows added)")
+        else:
+            self.set_status("backfill added 0 rows: run the kalshi check for candlestick diagnostics")
+        if mid == self.selected:
+            self.redraw()
+
+    # ---------- signals ----------
+    @work(thread=True, exclusive=True, group="signals")  # own group so it doesn't cancel fetch
+    def run_signals(self) -> None:
+        try:
+            if self.report is None or time.time() - self.report_ts > 600:
+                self.report = analyze(DB_PATH)
+                self.report_ts = time.time()
+            text = self.report.summary(self.selected)
+        except Exception as e:
+            text = f"signals failed: {e}"
+        self.call_from_thread(self.notify, text, title="Signals", timeout=20)
+
     # ---------- actions ----------
     def set_status(self, text: str) -> None:
         self.sub_title = text + (" [PAUSED]" if self.paused else "")
+
+    def action_signals(self) -> None:
+        self.notify("Training model...", timeout=3)
+        self.run_signals()
 
     def action_focus_filter(self) -> None:
         self.query_one(Input).focus()

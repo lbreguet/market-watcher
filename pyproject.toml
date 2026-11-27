@@ -11,12 +11,14 @@ dependencies = [
     "openpyxl>=3.1.5",
     "pandas>=3.1.1",
     "requests>=2.34.2",
+    "scikit-learn>=1.9.1",
     "textual>=8.2.8",
     "textual-plotext>=1.0.1",
 ]
 
 [project.scripts]
-market-watcher = "market_watcher.data_show:main"
+market-watcher = "market_watcher.tui:main"
+market-watcher-check = "market_watcher.kalshi:check"
 
 [build-system]
 requires = ["uv_build>=0.13.10,<0.14.0"]
